@@ -150,7 +150,7 @@ class _PatchedDispatcher(dispatcher.dispatcher):
             exc = e
             response = e.get_response(environ)
 
-        if 'application/json' in response.mimetype:
+        if 'application/json' in response.mimetype and response.method not in 'HEAD OPTIONS':
             actual_status_code = getattr(response, "status_code", None)
             body = json.loads(response.get_data())
             json_status_code = body.get('status', None)
