@@ -76,15 +76,13 @@ def _rewrapped_app(
                         response_headers,
                         setter=otel_wsgi.default_response_propagation_setter
                     )
-                headers_dict = dict(response_headers)
-                _status = headers_dict.get('x-json-status', status)
                 if span:
                     otel_wsgi.add_response_attributes(
                         span,
-                        _status,
+                        status,
                         response_headers,
                     )
-                    status_code = otel_wsgi._parse_status_code(_status)
+                    status_code = otel_wsgi._parse_status_code(status)
                     if status_code is not None:
                         duration_attrs[SpanAttributes.HTTP_STATUS_CODE] = status_code
                     if (
@@ -98,7 +96,7 @@ def _rewrapped_app(
                     _logger.warning(
                         "Simplerr environ's OpenTelemetry span ",
                         "missing at _start_response(%s)",
-                        _status,
+                        status,
                     )
 
             return start_response(
@@ -149,20 +147,6 @@ class _PatchedDispatcher(dispatcher.dispatcher):
         except HTTPException as e:
             exc = e
             response = e.get_response(environ)
-
-        if 'application/json' in response.mimetype and response.method not in 'HEAD OPTIONS':
-            actual_status_code = getattr(response, "status_code", None)
-            body = json.loads(response.get_data())
-            json_status_code = body.get('status', None)
-            try:
-                if json_status_code:
-                    if int(actual_status_code) != int(json_status_code):
-                        _logger.warning(f'Response has HTTP {actual_status_code} but JSON has {json_status_code}')
-                    response.headers.add("x-json-status",
-                                         f'{json_status_code} {HTTP_STATUS_CODES.get(json_status_code, "Unknown")}')
-            except ValueError:
-                _logger.warning(
-                    f'Failed to parse HTTP status code {actual_status_code} or JSON status code {json_status_code} as integers')
 
         result = response(environ, start_response)
 
