@@ -125,75 +125,6 @@ def _rewrapped_app(
     return _wrapped_app
 
 
-class _PatchedWeb(simplerr.web):
-    @staticmethod
-    def match(environ):
-        map = Map()
-        index = {}
-
-        for item in simplerr.web.destinations:
-            # Lets create an index on routes, as urls.match returns a route
-            index[item.endpoint] = item
-
-            # Create the rule and add it tot he map
-            rule = Rule(item.route, endpoint=item.endpoint, methods=item.methods)
-
-            index[item.endpoint].rule = rule
-
-            map.add(rule)
-
-        # Check for match
-        urls = map.bind_to_environ(environ)
-        endpoint, args = urls.match()
-
-        # Get match and attach current args
-        match = index[endpoint]
-        match.args = args
-
-        return match
-
-
-class _PatchedWebEvents(simplerr.dispatcher.WebEvents):
-    def fire_post_response(self, request, response, exc=None):
-        for fn in self.post_request:
-            fn(request, response, exc)
-
-
-# Todo add to the main code someday, keeping it clean with otel instrumentation
-class _PatchedDispatcher(dispatcher.dispatcher):
-    # Recreating the dispatch request
-    def __call__(self, environ, start_response):
-        request = simplerr.dispatcher.WebRequest(environ)
-
-        exc = None
-
-        try:
-            simplerr.web.restore_presets()
-
-            sc = script.script(self.cwd, request.path, extension=self.extension)
-            sc.get_module()
-            match = simplerr.web.match(environ)
-            if match:
-                request.url_rule = match
-                environ['simplerr.url_rule'] = match
-            self.global_events.fire_pre_response(request)
-            request.view_events.fire_pre_response(request)
-
-            response = simplerr.web.process(request, environ, self.cwd)
-        except OSError as e:
-            exc = e
-            response = NotFound()
-        except HTTPException as e:
-            exc = e
-            response = e
-
-        result = response(environ, start_response)
-
-        request.view_events.fire_post_response(request, response)
-        self.global_events.fire_post_response(request, response, exc)
-        return result
-
-
 class _InstrumentedWsgi(dispatcher.wsgi):
     _excluded_urls = None
     _enable_commenter = True
@@ -290,7 +221,6 @@ class _InstrumentedWsgi(dispatcher.wsgi):
             if simplerr_request_environ.get(_ENVIRON_TOKEN, None):
                 context.detach(simplerr_request_environ[_ENVIRON_TOKEN])
 
-        self.global_events = _PatchedWebEvents()
         self.global_events.on_pre_response(pre_response)
         self.global_events.on_post_response(post_response)
 
@@ -320,8 +250,6 @@ class SimplerrInstrumentor(BaseInstrumentor):
         meter_provider = kwargs.get('meter_provider')
         _InstrumentedWsgi._meter_provider = meter_provider
 
-        simplerr.web = _PatchedWeb
-        simplerr.dispatcher.dispatcher = _PatchedDispatcher
         simplerr.dispatcher.wsgi = _InstrumentedWsgi
 
     def _uninstrument(self, **kwargs):
