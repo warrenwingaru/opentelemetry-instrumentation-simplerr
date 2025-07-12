@@ -2,7 +2,6 @@
 This library builds on the OpenTelemetry WSGI middleware to track web requests
 in Simplerr applications.
 """
-import json
 from logging import getLogger
 from timeit import default_timer
 from typing import Collection
@@ -21,6 +20,7 @@ from opentelemetry.util.http import parse_excluded_urls, get_excluded_urls
 from simplerr import dispatcher, script
 from werkzeug.exceptions import NotFound, HTTPException
 from werkzeug.http import HTTP_STATUS_CODES
+from werkzeug.routing import Map, Rule
 
 from opentelemetry import context, trace
 from opentelemetry.instrumentation.simplerr.package import _instruments
@@ -36,14 +36,14 @@ _ENVIRON_TOKEN = "opentelemetry-simplerr.token"
 _excluded_urls_from_env = get_excluded_urls("SIMPLERR")
 
 
-def get_default_span_name(environ):
-    method = environ.get("REQUEST_METHOD", "")
+def get_default_span_name(request):
+    method = request.environ.get("REQUEST_METHOD", "")
     if method == "_OTHER":
         method = "HTTP"
     try:
-        span_name = f"{method} {environ['PATH_INFO']}"
+        span_name = f"{method} {request.url_rule.rule}"
     except AttributeError:
-        span_name = otel_wsgi.get_default_span_name(environ)
+        span_name = otel_wsgi.get_default_span_name(request.environ)
     return span_name
 
 
@@ -64,10 +64,17 @@ def _rewrapped_app(
         duration_attrs = otel_wsgi._parse_duration_attrs(attributes)
         active_request_counter.add(1, active_requests_count_attrs)
 
-        request_route = wrapped_app_environ.get("PATH_INFO", None)
+        request_route = None
 
         def _start_response(status, response_headers, *args, **kwargs):
-            if excluded_urls is None or not excluded_urls.url_disabled(request_route):
+            url_rule = wrapped_app_environ.get("simplerr.url_rule", None)
+            if url_rule and (
+                    excluded_urls is None
+                    or not excluded_urls.url_disabled(wrapped_app_environ.get('PATH_INFO', None))
+            ):
+                nonlocal request_route
+                request_route = url_rule.rule
+
                 span = wrapped_app_environ.get(_ENVIRON_SPAN_KEY)
 
                 propagator = get_global_response_propagator()
@@ -111,11 +118,39 @@ def _rewrapped_app(
         if request_route:
             duration_attrs[SpanAttributes.HTTP_ROUTE] = str(request_route)
 
-        duration_histogram.record(max(round(duration_s * 1000 ), 0), duration_attrs)
+        duration_histogram.record(max(round(duration_s * 1000), 0), duration_attrs)
         active_request_counter.add(-1, active_requests_count_attrs)
         return result
 
     return _wrapped_app
+
+
+class _PatchedWeb(simplerr.web):
+    @staticmethod
+    def match(environ):
+        map = Map()
+        index = {}
+
+        for item in simplerr.web.destinations:
+            # Lets create an index on routes, as urls.match returns a route
+            index[item.endpoint] = item
+
+            # Create the rule and add it tot he map
+            rule = Rule(item.route, endpoint=item.endpoint, methods=item.methods)
+
+            index[item.endpoint].rule = rule
+
+            map.add(rule)
+
+        # Check for match
+        urls = map.bind_to_environ(environ)
+        endpoint, args = urls.match()
+
+        # Get match and attach current args
+        match = index[endpoint]
+        match.args = args
+
+        return match
 
 
 class _PatchedWebEvents(simplerr.dispatcher.WebEvents):
@@ -130,8 +165,6 @@ class _PatchedDispatcher(dispatcher.dispatcher):
     def __call__(self, environ, start_response):
         request = simplerr.dispatcher.WebRequest(environ)
 
-        self.global_events.fire_pre_response(request)
-        request.view_events.fire_pre_response(request)
         exc = None
 
         try:
@@ -139,14 +172,20 @@ class _PatchedDispatcher(dispatcher.dispatcher):
 
             sc = script.script(self.cwd, request.path, extension=self.extension)
             sc.get_module()
+            match = simplerr.web.match(environ)
+            if match:
+                request.url_rule = match
+                environ['simplerr.url_rule'] = match
+            self.global_events.fire_pre_response(request)
+            request.view_events.fire_pre_response(request)
 
             response = simplerr.web.process(request, environ, self.cwd)
-        except (NotFound, OSError) as e:
+        except OSError as e:
             exc = e
-            response = NotFound().get_response(environ)
+            response = NotFound()
         except HTTPException as e:
             exc = e
-            response = e.get_response(environ)
+            response = e
 
         result = response(environ, start_response)
 
@@ -198,16 +237,16 @@ class _InstrumentedWsgi(dispatcher.wsgi):
 
         def pre_response(request):
             excluded_urls = _InstrumentedWsgi._excluded_urls
-            simplerr_request_environ = request.environ
-            request_route = simplerr_request_environ.get("PATH_INFO", None)
 
-            if excluded_urls and excluded_urls.url_disabled(request_route):
+            if excluded_urls and excluded_urls.url_disabled(request.url):
                 return
 
-            span_name = get_default_span_name(simplerr_request_environ)
+            simplerr_request_environ = request.environ
+            span_name = get_default_span_name(request)
             attributes = otel_wsgi.collect_request_attributes(simplerr_request_environ)
-            if request_route:
-                attributes[SpanAttributes.HTTP_ROUTE] = str(request_route)
+
+            if request.url_rule:
+                attributes[SpanAttributes.HTTP_ROUTE] = str(request.url_rule.rule)
 
             span, token = _start_internal_or_server_span(
                 tracer=tracer,
@@ -235,13 +274,12 @@ class _InstrumentedWsgi(dispatcher.wsgi):
 
         def post_response(request, response, exc):
             excluded_urls = _InstrumentedWsgi._excluded_urls
-            simplerr_request_environ = request.environ
-            request_route = simplerr_request_environ.get("PATH_INFO", None)
 
-            if excluded_urls and excluded_urls.url_disabled(request_route):
+            if excluded_urls and excluded_urls.url_disabled(request.url):
                 return
+            simplerr_request_environ = request.environ
 
-            activation = request.environ.get(_ENVIRON_ACTIVATION_KEY)
+            activation = simplerr_request_environ.get(_ENVIRON_ACTIVATION_KEY)
             if not activation:
                 return
             if exc is None:
@@ -249,8 +287,8 @@ class _InstrumentedWsgi(dispatcher.wsgi):
             else:
                 activation.__exit__(type(exc), exc, getattr(exc, "__traceback__", None))
 
-            if request.environ.get(_ENVIRON_TOKEN, None):
-                context.detach(request.environ[_ENVIRON_TOKEN])
+            if simplerr_request_environ.get(_ENVIRON_TOKEN, None):
+                context.detach(simplerr_request_environ[_ENVIRON_TOKEN])
 
         self.global_events = _PatchedWebEvents()
         self.global_events.on_pre_response(pre_response)
@@ -263,6 +301,8 @@ class SimplerrInstrumentor(BaseInstrumentor):
 
     def _instrument(self, **kwargs):
         self._original_wsgi = dispatcher.wsgi
+        self._original_web = simplerr.web
+        self._original_dispatcher = dispatcher.dispatcher
 
         tracer_provider = kwargs.get('tracer_provider')
         _InstrumentedWsgi._tracer_provider = tracer_provider
@@ -280,8 +320,11 @@ class SimplerrInstrumentor(BaseInstrumentor):
         meter_provider = kwargs.get('meter_provider')
         _InstrumentedWsgi._meter_provider = meter_provider
 
+        simplerr.web = _PatchedWeb
         simplerr.dispatcher.dispatcher = _PatchedDispatcher
         simplerr.dispatcher.wsgi = _InstrumentedWsgi
 
     def _uninstrument(self, **kwargs):
         simplerr.dispatcher.wsgi = self._original_wsgi
+        simplerr.web = self._original_web
+        simplerr.dispatcher.dispatcher = self._original_dispatcher
