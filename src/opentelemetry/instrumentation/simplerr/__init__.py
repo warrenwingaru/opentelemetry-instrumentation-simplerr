@@ -41,7 +41,7 @@ def get_default_span_name(request):
     if method == "_OTHER":
         method = "HTTP"
     try:
-        span_name = f"{method} {request.url_rule.rule}"
+        span_name = f"{method} {request.url_route.rule}"
     except AttributeError:
         span_name = otel_wsgi.get_default_span_name(request.environ)
     return span_name
@@ -67,13 +67,13 @@ def _rewrapped_app(
         request_route = None
 
         def _start_response(status, response_headers, *args, **kwargs):
-            url_rule = wrapped_app_environ.get("simplerr.url_rule", None)
-            if url_rule and (
+            url_route = wrapped_app_environ.get("simplerr.url_route", None)
+            if url_route and (
                     excluded_urls is None
                     or not excluded_urls.url_disabled(wrapped_app_environ.get('PATH_INFO', None))
             ):
                 nonlocal request_route
-                request_route = url_rule.rule
+                request_route = url_route.rule
 
                 span = wrapped_app_environ.get(_ENVIRON_SPAN_KEY)
 
@@ -176,8 +176,8 @@ class _InstrumentedWsgi(dispatcher.wsgi):
             span_name = get_default_span_name(request)
             attributes = otel_wsgi.collect_request_attributes(simplerr_request_environ)
 
-            if request.url_rule:
-                attributes[SpanAttributes.HTTP_ROUTE] = str(request.url_rule.rule)
+            if request.url_route:
+                attributes[SpanAttributes.HTTP_ROUTE] = str(request.url_route.rule)
 
             span, token = _start_internal_or_server_span(
                 tracer=tracer,
