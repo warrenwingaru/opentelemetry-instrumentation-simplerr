@@ -19,8 +19,6 @@ from opentelemetry.util._time import _time_ns
 from opentelemetry.util.http import parse_excluded_urls, get_excluded_urls
 from simplerr import dispatcher, script
 from werkzeug.exceptions import NotFound, HTTPException
-from werkzeug.http import HTTP_STATUS_CODES
-from werkzeug.routing import Map, Rule
 
 from opentelemetry import context, trace
 from opentelemetry.instrumentation.simplerr.package import _instruments
@@ -101,8 +99,7 @@ def _rewrapped_app(
                             span.set_attributes(custom_attributes)
                 else:
                     _logger.warning(
-                        "Simplerr environ's OpenTelemetry span ",
-                        "missing at _start_response(%s)",
+                        "Simplerr environ's OpenTelemetry span missing at _start_response(%s)",
                         status,
                     )
 
@@ -132,8 +129,8 @@ class _InstrumentedWsgi(dispatcher.wsgi):
     _meter_provider = None
     _trace_provider = None
 
-    def make_app(self):
-        self.app = super().make_app()
+    def make_app(self, *args, **kwargs):
+        self.app = super().make_app(*args, **kwargs)
         self.app = _rewrapped_app(self.app, self.active_request_counter,
                                   duration_histogram=self.duration_histogram,
                                   excluded_urls=_InstrumentedWsgi._excluded_urls)
@@ -211,11 +208,18 @@ class _InstrumentedWsgi(dispatcher.wsgi):
             simplerr_request_environ = request.environ
 
             activation = simplerr_request_environ.get(_ENVIRON_ACTIVATION_KEY)
+            span = simplerr_request_environ.get(_ENVIRON_SPAN_KEY)
             if not activation:
                 return
             if exc is None:
                 activation.__exit__(None, None, None)
             else:
+                # Monitor routes that are registered but exited early
+                if request.url_route:
+                    if isinstance(exc, HTTPException):
+                        span.set_attribute(SpanAttributes.HTTP_STATUS_CODE, exc.code)
+                    if isinstance(exc, FileNotFoundError):
+                        span.set_attribute(SpanAttributes.HTTP_STATUS_CODE, 404)
                 activation.__exit__(type(exc), exc, getattr(exc, "__traceback__", None))
 
             if simplerr_request_environ.get(_ENVIRON_TOKEN, None):
