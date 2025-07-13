@@ -2,6 +2,7 @@
 This library builds on the OpenTelemetry WSGI middleware to track web requests
 in Simplerr applications.
 """
+import functools
 from logging import getLogger
 from timeit import default_timer
 from typing import Collection
@@ -66,12 +67,13 @@ def _rewrapped_app(
 
         def _start_response(status, response_headers, *args, **kwargs):
             url_route = wrapped_app_environ.get("simplerr.url_route", None)
-            if url_route and (
+            if (
                     excluded_urls is None
                     or not excluded_urls.url_disabled(wrapped_app_environ.get('PATH_INFO', None))
             ):
                 nonlocal request_route
-                request_route = url_route.rule
+                if hasattr(url_route, 'rule'):
+                    request_route = url_route.rule
 
                 span = wrapped_app_environ.get(_ENVIRON_SPAN_KEY)
 
@@ -87,6 +89,9 @@ def _rewrapped_app(
                         status,
                         response_headers,
                     )
+                    if request_route:
+                        span.set_attribute(SpanAttributes.HTTP_ROUTE, str(request_route))
+
                     status_code = otel_wsgi._parse_status_code(status)
                     if status_code is not None:
                         duration_attrs[SpanAttributes.HTTP_STATUS_CODE] = status_code
@@ -99,7 +104,8 @@ def _rewrapped_app(
                             span.set_attributes(custom_attributes)
                 else:
                     _logger.warning(
-                        "Simplerr environ's OpenTelemetry span missing at _start_response(%s)",
+                        "Simplerr environ's OpenTelemetry span"
+                        " missing at _start_response(%s)",
                         status,
                     )
 
@@ -131,9 +137,12 @@ class _InstrumentedWsgi(dispatcher.wsgi):
 
     def make_app(self, *args, **kwargs):
         self.app = super().make_app(*args, **kwargs)
-        self.app = _rewrapped_app(self.app, self.active_request_counter,
-                                  duration_histogram=self.duration_histogram,
-                                  excluded_urls=_InstrumentedWsgi._excluded_urls)
+        self.app = _rewrapped_app(
+            self.app,
+            self.active_request_counter,
+            duration_histogram=self.duration_histogram,
+            excluded_urls=_InstrumentedWsgi._excluded_urls
+        )
         return self.app
 
     def __init__(self, *args, **kwargs):
@@ -163,70 +172,11 @@ class _InstrumentedWsgi(dispatcher.wsgi):
             _InstrumentedWsgi._trace_provider,
         )
 
-        def pre_response(request):
-            excluded_urls = _InstrumentedWsgi._excluded_urls
+        self._post_response = _wrapped_post_response(excluded_urls=_InstrumentedWsgi._excluded_urls)
+        self._pre_response = _wrapped_pre_response(tracer=tracer, excluded_urls=_InstrumentedWsgi._excluded_urls)
 
-            if excluded_urls and excluded_urls.url_disabled(request.url):
-                return
-
-            simplerr_request_environ = request.environ
-            span_name = get_default_span_name(request)
-            attributes = otel_wsgi.collect_request_attributes(simplerr_request_environ)
-
-            if request.url_route:
-                attributes[SpanAttributes.HTTP_ROUTE] = str(request.url_route.rule)
-
-            span, token = _start_internal_or_server_span(
-                tracer=tracer,
-                span_name=span_name,
-                start_time=simplerr_request_environ.get(_ENVIRON_STARTTIME_KEY),
-                context_carrier=simplerr_request_environ,
-                context_getter=otel_wsgi.wsgi_getter,
-                attributes=attributes
-            )
-            if span.is_recording():
-                for key, value in attributes.items():
-                    span.set_attribute(key, value)
-                if span.is_recording() and span.kind == trace.SpanKind.SERVER:
-                    custom_attributes = otel_wsgi.collect_custom_request_headers_attributes(
-                        simplerr_request_environ,
-                    )
-
-                    if len(custom_attributes) > 0:
-                        span.set_attributes(custom_attributes)
-            activation = trace.use_span(span, end_on_exit=True)
-            activation.__enter__()
-            simplerr_request_environ[_ENVIRON_ACTIVATION_KEY] = activation
-            simplerr_request_environ[_ENVIRON_SPAN_KEY] = span
-            simplerr_request_environ[_ENVIRON_TOKEN] = token
-
-        def post_response(request, response, exc):
-            excluded_urls = _InstrumentedWsgi._excluded_urls
-
-            if excluded_urls and excluded_urls.url_disabled(request.url):
-                return
-            simplerr_request_environ = request.environ
-
-            activation = simplerr_request_environ.get(_ENVIRON_ACTIVATION_KEY)
-            span = simplerr_request_environ.get(_ENVIRON_SPAN_KEY)
-            if not activation:
-                return
-            if exc is None:
-                activation.__exit__(None, None, None)
-            else:
-                # Monitor routes that are registered but exited early
-                if request.url_route:
-                    if isinstance(exc, HTTPException):
-                        span.set_attribute(SpanAttributes.HTTP_STATUS_CODE, exc.code)
-                    if isinstance(exc, FileNotFoundError):
-                        span.set_attribute(SpanAttributes.HTTP_STATUS_CODE, 404)
-                activation.__exit__(type(exc), exc, getattr(exc, "__traceback__", None))
-
-            if simplerr_request_environ.get(_ENVIRON_TOKEN, None):
-                context.detach(simplerr_request_environ[_ENVIRON_TOKEN])
-
-        self.global_events.on_pre_response(pre_response)
-        self.global_events.on_post_response(post_response)
+        self.global_events.on_pre_response(self._pre_response)
+        self.global_events.on_post_response(self._post_response)
 
 
 class SimplerrInstrumentor(BaseInstrumentor):
@@ -234,9 +184,7 @@ class SimplerrInstrumentor(BaseInstrumentor):
         return _instruments
 
     def _instrument(self, **kwargs):
-        self._original_wsgi = dispatcher.wsgi
-        self._original_web = simplerr.web
-        self._original_dispatcher = dispatcher.dispatcher
+        self._original_wsgi = simplerr.dispatcher.wsgi
 
         tracer_provider = kwargs.get('tracer_provider')
         _InstrumentedWsgi._tracer_provider = tracer_provider
@@ -258,5 +206,133 @@ class SimplerrInstrumentor(BaseInstrumentor):
 
     def _uninstrument(self, **kwargs):
         simplerr.dispatcher.wsgi = self._original_wsgi
-        simplerr.web = self._original_web
-        simplerr.dispatcher.dispatcher = self._original_dispatcher
+
+    @staticmethod
+    def instrument_wsgi(wsgi, tracer_provider=None, excluded_urls=None, meter_provider=None):
+        if not hasattr(wsgi, '_is_instrumented_by_opentelemetry'):
+            wsgi._is_instrumented_by_opentelemetry = False
+
+        if not wsgi._is_instrumented_by_opentelemetry:
+            excluded_urls = (
+                parse_excluded_urls(excluded_urls)
+                if excluded_urls is not None
+                else _excluded_urls_from_env
+            )
+            meter = get_meter(
+                __name__,
+                __version__,
+                meter_provider,
+            )
+            duration_histogram = meter.create_histogram(
+                name="http.server.duration",
+                unit="ms",
+                description="measures the duration of the inbound HTTP request",
+            )
+            active_request_counter = meter.create_up_down_counter(
+                name="http.server.active_requests",
+                unit="requests",
+                description="measures the number of concurrent HTTP requests that are currently in-flight"
+            )
+            wsgi._original_make_app = wsgi.make_app
+
+            @functools.wraps(wsgi._original_make_app)
+            def _make_app(*args, **kwargs):
+                app = wsgi._original_make_app(*args, **kwargs)
+                app = _rewrapped_app(app, active_request_counter, duration_histogram=duration_histogram,
+                                     excluded_urls=excluded_urls)
+                return app
+
+            wsgi.make_app = _make_app
+
+            tracer = trace.get_tracer(
+                __name__,
+                __version__,
+                tracer_provider,
+            )
+
+            _post_response = _wrapped_post_response(excluded_urls=excluded_urls)
+            _pre_response = _wrapped_pre_response(tracer=tracer, excluded_urls=excluded_urls)
+
+            wsgi._post_response = _post_response
+            wsgi._pre_response = _pre_response
+
+            wsgi.global_events.on_pre_response(_pre_response)
+            wsgi.global_events.on_post_response(_post_response)
+            wsgi._is_instrumented_by_opentelemetry = True
+        else:
+            _logger.warning("Attempting to instrument Simplerr app while already instrumented")
+
+    @staticmethod
+    def uninstrument_wsgi(wsgi):
+        if hasattr(wsgi, '_original_make_app'):
+            wsgi.make_app = wsgi._original_make_app
+
+            wsgi.global_events.off_pre_response(wsgi._pre_response)
+            wsgi.global_events.off_post_response(wsgi._post_response)
+            del wsgi._original_make_app
+            wsgi._is_instrumented_by_opentelemetry = False
+        else:
+            _logger.warning("Attempting to uninstrument Simplerr "
+                            "app while already uninstrumented")
+
+
+def _wrapped_pre_response(
+        tracer=None,
+        excluded_urls=None,
+):
+    def _pre_response(request):
+        if excluded_urls and excluded_urls.url_disabled(request.url):
+            return
+
+        simplerr_request_environ = request.environ
+        span_name = get_default_span_name(request)
+
+        span, token = _start_internal_or_server_span(
+            tracer=tracer,
+            span_name=span_name,
+            start_time=simplerr_request_environ.get(_ENVIRON_STARTTIME_KEY),
+            context_carrier=simplerr_request_environ,
+            context_getter=otel_wsgi.wsgi_getter,
+        )
+
+        if span.is_recording():
+            attributes = otel_wsgi.collect_request_attributes(simplerr_request_environ)
+            for key, value in attributes.items():
+                span.set_attribute(key, value)
+            if span.is_recording() and span.kind == trace.SpanKind.SERVER:
+                custom_attributes = otel_wsgi.collect_custom_request_headers_attributes(
+                    simplerr_request_environ,
+                )
+
+                if len(custom_attributes) > 0:
+                    span.set_attributes(custom_attributes)
+
+        activation = trace.use_span(span, end_on_exit=True)
+        activation.__enter__()
+        simplerr_request_environ[_ENVIRON_ACTIVATION_KEY] = activation
+        simplerr_request_environ[_ENVIRON_SPAN_KEY] = span
+        simplerr_request_environ[_ENVIRON_TOKEN] = token
+
+    return _pre_response
+
+
+def _wrapped_post_response(
+        excluded_urls=None,
+):
+    def _post_response(request, response, exc):
+        if excluded_urls and excluded_urls.url_disabled(request.url):
+            return
+        simplerr_request_environ = request.environ
+
+        activation = simplerr_request_environ.get(_ENVIRON_ACTIVATION_KEY)
+        if not activation:
+            return
+        if exc is None:
+            activation.__exit__(None, None, None)
+        else:
+            activation.__exit__(type(exc), exc, getattr(exc, "__traceback__", None))
+
+        if simplerr_request_environ.get(_ENVIRON_TOKEN, None):
+            context.detach(simplerr_request_environ[_ENVIRON_TOKEN])
+
+    return _post_response
