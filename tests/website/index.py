@@ -19,7 +19,7 @@ def excluded_helloid(request, helloid):
 
 @simplerr.web("/excluded")
 def excluded_endpoint():
-    return
+    return 'excluded'
 
 
 @simplerr.web("/excluded2")

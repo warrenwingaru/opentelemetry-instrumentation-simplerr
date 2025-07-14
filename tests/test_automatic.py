@@ -3,6 +3,7 @@ import os
 from werkzeug.test import Client
 from werkzeug.wrappers import Response
 
+import simplerr.dispatcher
 from opentelemetry.instrumentation.simplerr import SimplerrInstrumentor
 from opentelemetry.test.wsgitestutil import WsgiTestBase
 from .base_test import InstrumentationTest

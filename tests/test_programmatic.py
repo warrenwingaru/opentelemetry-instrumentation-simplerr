@@ -65,9 +65,8 @@ class TestProgrammatic(InstrumentationTest, WsgiTestBase):
         )
         self.exclude_patch.start()
 
-        wsgi = simplerr.dispatcher.wsgi('tests/website', '0.0.0.0', 80)
-        SimplerrInstrumentor().instrument_wsgi(wsgi)
-        self._create_app(wsgi)
+        self.app = simplerr.dispatcher.wsgi('tests/website')
+        SimplerrInstrumentor().instrument_app(self.app)
 
         self._common_initialization()
 
@@ -76,7 +75,7 @@ class TestProgrammatic(InstrumentationTest, WsgiTestBase):
         self.env_patch.stop()
         self.exclude_patch.stop()
         with self.disable_logging():
-            SimplerrInstrumentor().uninstrument_wsgi(self.wsgi)
+            SimplerrInstrumentor().uninstrument_app(self.app)
 
     def test_instrument_app_and_instrument(self):
         SimplerrInstrumentor().instrument()
@@ -94,7 +93,7 @@ class TestProgrammatic(InstrumentationTest, WsgiTestBase):
         span_list = self.memory_exporter.get_finished_spans()
         self.assertEqual(len(span_list), 1)
 
-        SimplerrInstrumentor().uninstrument_wsgi(self.wsgi)
+        SimplerrInstrumentor().uninstrument_app(self.app)
 
         resp = self.client.get("/hello/123")
         self.assertEqual(200, resp.status_code)
@@ -104,7 +103,7 @@ class TestProgrammatic(InstrumentationTest, WsgiTestBase):
 
     def test_uninstrument_app_and_instrument(self):
         SimplerrInstrumentor().instrument()
-        SimplerrInstrumentor().uninstrument_wsgi(self.wsgi)
+        SimplerrInstrumentor().uninstrument_app(self.app)
         resp = self.client.get("/hello/123")
         self.assertEqual(200, resp.status_code)
         self.assertEqual([b"Hello: 123"], list(resp.response))
@@ -286,6 +285,8 @@ class TestProgrammatic(InstrumentationTest, WsgiTestBase):
                 for metric in scope_metric.metrics:
                     for point in list(metric.data.data_points):
                         if isinstance(point, HistogramDataPoint):
+                            print(expected_duration_attr)
+                            print(dict(point.attributes))
                             self.assertDictEqual(
                                 expected_duration_attr,
                                 dict(point.attributes)
@@ -300,7 +301,7 @@ class TestProgrammatic(InstrumentationTest, WsgiTestBase):
 
     def test_metric_uninstrument(self):
         self.client.delete("/hello/756")
-        SimplerrInstrumentor().uninstrument_wsgi(self.wsgi)
+        SimplerrInstrumentor().uninstrument_app(self.app)
         self.client.delete("/hello/756")
         metrics_list = self.memory_metrics_reader.get_metrics_data()
         for resource_metric in metrics_list.resource_metrics:
