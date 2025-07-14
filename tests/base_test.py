@@ -2,7 +2,7 @@ import os
 
 import simplerr.dispatcher
 from werkzeug.test import Client
-from werkzeug.wrappers import Response
+from simplerr import Response
 
 class InstrumentationTest:
     @staticmethod
@@ -19,14 +19,10 @@ class InstrumentationTest:
         resp.headers['custom-header'] = 'my-custom-value-1,my-custom-value-2'
         return resp
 
+    def _create_app(self):
+        self.app = simplerr.dispatcher.wsgi('tests/website')
+
     def _common_initialization(self):
         self.cwd = os.path.dirname(__file__)
         self.client = Client(self.app, Response)
 
-
-    def _create_app(self, wsgi=None):
-        if not wsgi:
-            self.wsgi = simplerr.dispatcher.wsgi('tests/website', '0.0.0.0', 5000)
-        else:
-            self.wsgi = wsgi
-        self.app = self.wsgi.make_app()
