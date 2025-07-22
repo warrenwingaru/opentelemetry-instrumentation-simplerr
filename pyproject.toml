@@ -1,0 +1,59 @@
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "opentelemetry-instrumentation-simplerr"
+description = "Simplerr instrumentation for OpenTelemetry"
+readme = "README.rst"
+readme-content-type = "text/x-rst"
+authors = [
+    {name = "Warren Angelo H. Layson", email = "warren@wingaru.com.au"}
+]
+license = {text = "Apache-2.0"}
+classifiers = [
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+requires-python = ">=3.6"
+dynamic = ["version"]
+dependencies = [
+    "opentelemetry-util-http == 0.43b0",
+    "opentelemetry-instrumentation == 0.43b0",
+    "opentelemetry-instrumentation-wsgi == 0.43b0",
+    "opentelemetry-api ~= 1.12",
+    "opentelemetry-semantic-conventions == 0.43b0"
+]
+
+[project.optional-dependencies]
+instruments = [
+    "simplerr >= 0.18.2.dev3, <= 0.18.5",
+    "werkzeug < 3.0.0"
+]
+test = [
+    "opentelemetry-instrumentation-simplerr[instruments]",
+    "opentelemetry-test-utils == 0.43b0",
+]
+
+[project.entry-points."opentelemetry_instrumentor"]
+simplerr = "opentelemetry.instrumentation.simplerr:SimplerrInstrumentor"
+
+[tool.hatch.version]
+path = "src/opentelemetry/instrumentation/simplerr/version.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/opentelemetry"]
