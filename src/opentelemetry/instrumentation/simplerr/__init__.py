@@ -7,22 +7,39 @@ from time import time_ns
 from timeit import default_timer
 from typing import Collection
 
+import simplerr
+import simplerr.dispatcher
+
 import opentelemetry.instrumentation.wsgi as otel_wsgi
+from opentelemetry.instrumentation._semconv import (
+    _OpenTelemetrySemanticConventionStability,
+    _OpenTelemetryStabilitySignalType,
+    _get_schema_url,
+    _report_old,
+    _report_new,
+    _StabilityMode
+)
+from opentelemetry import context, trace
+from opentelemetry.instrumentation.simplerr.package import _instruments
+from opentelemetry.instrumentation.simplerr.version import __version__
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.propagators import (
     get_global_response_propagator,
 )
 from opentelemetry.instrumentation.utils import _start_internal_or_server_span
 from opentelemetry.metrics import get_meter
+from opentelemetry.semconv.attributes.http_attributes import HTTP_ROUTE
 from opentelemetry.semconv.metrics import MetricInstruments
+from opentelemetry.semconv.metrics.http_metrics import (
+    HTTP_SERVER_REQUEST_DURATION
+)
 from opentelemetry.semconv.trace import SpanAttributes
-from opentelemetry.util.http import parse_excluded_urls, get_excluded_urls
-
-import simplerr
-from opentelemetry import context, trace
-from opentelemetry.instrumentation.simplerr.package import _instruments
-from opentelemetry.instrumentation.simplerr.version import __version__
-from simplerr import dispatcher
+from opentelemetry.util._importlib_metadata import version
+from opentelemetry.util.http import (
+    parse_excluded_urls,
+    get_excluded_urls,
+    sanitize_method
+)
 
 _logger = getLogger(__name__)
 
@@ -33,9 +50,15 @@ _ENVIRON_TOKEN = "opentelemetry-simplerr.token"
 
 _excluded_urls_from_env = get_excluded_urls("SIMPLERR")
 
+simplerr_version = version("simplerr")
+
+print(f'simplerr version: {simplerr_version}')
+
 
 def get_default_span_name(request):
-    method = request.environ.get("REQUEST_METHOD", "")
+    method = sanitize_method(
+        request.environ.get("REQUEST_METHOD", "").strip()
+    )
     if method == "_OTHER":
         method = "HTTP"
     try:
@@ -48,18 +71,24 @@ def get_default_span_name(request):
 def _rewrapped_app(
         wsgi_app,
         active_request_counter,
-        duration_histogram,
+        duration_histogram_old=None,
+        duration_histogram_new=None,
         excluded_urls=None,
+        sem_conv_opt_in_mode=None,
 ):
     def _wrapped_app(wrapped_app_environ, start_response):
         wrapped_app_environ[_ENVIRON_STARTTIME_KEY] = time_ns()
 
         start = default_timer()
-        attributes = otel_wsgi.collect_request_attributes(wrapped_app_environ)
-        active_requests_count_attrs = (
-            otel_wsgi._parse_active_request_count_attrs(attributes)
+        attributes = otel_wsgi.collect_request_attributes(
+            wrapped_app_environ, sem_conv_opt_in_mode
         )
-        duration_attrs = otel_wsgi._parse_duration_attrs(attributes)
+        active_requests_count_attrs = (
+            otel_wsgi._parse_active_request_count_attrs(
+                attributes,
+                sem_conv_opt_in_mode
+            )
+        )
         active_request_counter.add(1, active_requests_count_attrs)
 
         request_route = None
@@ -87,11 +116,9 @@ def _rewrapped_app(
                         span,
                         status,
                         response_headers,
+                        attributes,
+                        sem_conv_opt_in_mode
                     )
-
-                    status_code = otel_wsgi._parse_status_code(status)
-                    if status_code is not None:
-                        duration_attrs[SpanAttributes.HTTP_STATUS_CODE] = status_code
                     if (
                             span.is_recording()
                             and span.kind == trace.SpanKind.SERVER
@@ -114,23 +141,43 @@ def _rewrapped_app(
 
         result = wsgi_app(wrapped_app_environ, _start_response)
         duration_s = default_timer() - start
+        if duration_histogram_old:
+            duration_attrs_old = otel_wsgi._parse_duration_attrs(
+                attributes, _StabilityMode.DEFAULT
+            )
 
-        if request_route:
-            duration_attrs[SpanAttributes.HTTP_ROUTE] = str(request_route)
+            if request_route:
+                duration_attrs_old[SpanAttributes.HTTP_TARGET] = str(request_route)
 
-        duration_histogram.record(max(round(duration_s * 1000), 0), duration_attrs)
+            duration_histogram_old.record(
+                max(round(duration_s * 1000), 0), duration_attrs_old
+            )
+
+        if duration_histogram_new:
+            duration_attrs_new = otel_wsgi._parse_duration_attrs(
+                attributes, _StabilityMode.HTTP
+            )
+
+            if request_route:
+                duration_attrs_new[HTTP_ROUTE] = str(request_route)
+
+            duration_histogram_new.record(
+                max(duration_s, 0), duration_attrs_new
+            )
+
         active_request_counter.add(-1, active_requests_count_attrs)
         return result
 
     return _wrapped_app
 
 
-class _InstrumentedWsgi(dispatcher.wsgi):
+class _InstrumentedWsgi(simplerr.dispatcher.wsgi):
     _excluded_urls = None
     _enable_commenter = True
     _commenter_options = None
     _meter_provider = None
     _tracer_provider = None
+    _sem_conv_opt_in_mode = None
 
     def __init__(self, *args, **kwargs):
         super(_InstrumentedWsgi, self).__init__(*args, **kwargs)
@@ -142,31 +189,47 @@ class _InstrumentedWsgi(dispatcher.wsgi):
             __name__,
             __version__,
             _InstrumentedWsgi._meter_provider,
-            schema_url="https://opentelemetry.io/schemas/1.11.0",
+            schema_url=_get_schema_url(_InstrumentedWsgi._sem_conv_opt_in_mode),
         )
-        duration_histogram = meter.create_histogram(
-            name=MetricInstruments.HTTP_SERVER_DURATION,
-            unit="ms",
-            description="measures the duration of the inbound HTTP request",
-        )
+        duration_histogram_old = None
+        if _report_old(_InstrumentedWsgi._sem_conv_opt_in_mode):
+            duration_histogram_old = meter.create_histogram(
+                name=MetricInstruments.HTTP_SERVER_DURATION,
+                unit="ms",
+                description="measures the duration of the inbound HTTP request",
+            )
+
+        duration_histogram_new = None
+        if _report_new(_InstrumentedWsgi._sem_conv_opt_in_mode):
+            duration_histogram_new = meter.create_histogram(
+                name=HTTP_SERVER_REQUEST_DURATION,
+                unit="s",
+                description="Duration of HTTP server requests.",
+            )
+
         active_request_counter = meter.create_up_down_counter(
             name=MetricInstruments.HTTP_SERVER_ACTIVE_REQUESTS,
             unit="requests",
             description="measures the number of concurrent HTTP requests that are currently in-flight"
         )
-
-        self.wsgi_app = _rewrapped_app(self.wsgi_app, active_request_counter, duration_histogram=duration_histogram,
+        self.wsgi_app = _rewrapped_app(self.wsgi_app, active_request_counter,
+                                       duration_histogram_old=duration_histogram_old,
+                                       duration_histogram_new=duration_histogram_new,
+                                       sem_conv_opt_in_mode=_InstrumentedWsgi._sem_conv_opt_in_mode,
                                        excluded_urls=_InstrumentedWsgi._excluded_urls)
 
         tracer = trace.get_tracer(
             __name__,
             __version__,
             _InstrumentedWsgi._tracer_provider,
-            schema_url="https://opentelemetry.io/schemas/1.11.0"
+            schema_url=_get_schema_url(_InstrumentedWsgi._sem_conv_opt_in_mode),
         )
 
-        self._post_response = _wrapped_post_response(excluded_urls=_InstrumentedWsgi._excluded_urls)
-        self._pre_response = _wrapped_pre_response(tracer=tracer, excluded_urls=_InstrumentedWsgi._excluded_urls)
+        self._post_response = _wrapped_post_response(excluded_urls=_InstrumentedWsgi._excluded_urls, )
+        self._pre_response = _wrapped_pre_response(tracer=tracer, excluded_urls=_InstrumentedWsgi._excluded_urls,
+                                                   enable_commenter=_InstrumentedWsgi._enable_commenter,
+                                                   commenter_options=_InstrumentedWsgi._commenter_options,
+                                                   sem_conv_opt_in_mode=_InstrumentedWsgi._sem_conv_opt_in_mode)
 
         self.global_events.on_pre_response(self._pre_response)
         self.global_events.on_teardown_request(self._post_response)
@@ -174,7 +237,7 @@ class _InstrumentedWsgi(dispatcher.wsgi):
 
 class SimplerrInstrumentor(BaseInstrumentor):
     def instrumentation_dependencies(self) -> Collection[str]:
-        return _instruments
+        return ()
 
     def _instrument(self, **kwargs):
         self._original_wsgi = simplerr.dispatcher.wsgi
@@ -189,11 +252,18 @@ class SimplerrInstrumentor(BaseInstrumentor):
         )
 
         enable_commenter = kwargs.get('enable_commenter', True)
+        print(f'enable_commenter: {enable_commenter}')
         _InstrumentedWsgi._enable_commenter = enable_commenter
         commenter_options = kwargs.get('commenter_options', {})
         _InstrumentedWsgi._commenter_options = commenter_options
         meter_provider = kwargs.get('meter_provider')
         _InstrumentedWsgi._meter_provider = meter_provider
+
+        sem_conv_opt_in_mode = _OpenTelemetrySemanticConventionStability._get_opentelemetry_stability_opt_in_mode(
+            _OpenTelemetryStabilitySignalType.HTTP,
+        )
+
+        _InstrumentedWsgi._sem_conv_opt_in_mode = sem_conv_opt_in_mode
 
         simplerr.dispatcher.wsgi = _InstrumentedWsgi
 
@@ -201,11 +271,17 @@ class SimplerrInstrumentor(BaseInstrumentor):
         simplerr.dispatcher.wsgi = self._original_wsgi
 
     @staticmethod
-    def instrument_app(app, tracer_provider=None, excluded_urls=None, meter_provider=None):
+    def instrument_app(app, tracer_provider=None, excluded_urls=None, meter_provider=None, enable_commenter=True,
+                       commenter_options=None):
         if not hasattr(app, '_is_instrumented_by_opentelemetry'):
             app._is_instrumented_by_opentelemetry = False
 
         if not app._is_instrumented_by_opentelemetry:
+            # initialize semantic conventions opt-in if needed
+            _OpenTelemetrySemanticConventionStability._initialize()
+            sem_conv_opt_in_mode = _OpenTelemetrySemanticConventionStability._get_opentelemetry_stability_opt_in_mode(
+                _OpenTelemetryStabilitySignalType.HTTP
+            )
             excluded_urls = (
                 parse_excluded_urls(excluded_urls)
                 if excluded_urls is not None
@@ -215,32 +291,57 @@ class SimplerrInstrumentor(BaseInstrumentor):
                 __name__,
                 __version__,
                 meter_provider,
-                schema_url="https://opentelemetry.io/schemas/1.11.0",
+                schema_url=_get_schema_url(sem_conv_opt_in_mode)
             )
-            duration_histogram = meter.create_histogram(
-                name="http.server.duration",
-                unit="ms",
-                description="measures the duration of the inbound HTTP request",
-            )
+            duration_histogram_old = None
+            if _report_old(sem_conv_opt_in_mode):
+                duration_histogram_old = meter.create_histogram(
+                    name=MetricInstruments.HTTP_SERVER_DURATION,
+                    unit="ms",
+                    description="measures the duration of the inbound HTTP request",
+                )
+
+            duration_histogram_new = None
+            if _report_new(sem_conv_opt_in_mode):
+                duration_histogram_new = meter.create_histogram(
+                    name=HTTP_SERVER_REQUEST_DURATION,
+                    unit="s",
+                    description="Duration of HTTP server requests.",
+                )
+
             active_request_counter = meter.create_up_down_counter(
-                name="http.server.active_requests",
+                name=MetricInstruments.HTTP_SERVER_ACTIVE_REQUESTS,
                 unit="requests",
                 description="measures the number of concurrent HTTP requests that are currently in-flight"
             )
             app._original_wsgi_app = app.wsgi_app
 
-            app.wsgi_app = _rewrapped_app(app.wsgi_app, active_request_counter, duration_histogram=duration_histogram,
-                                          excluded_urls=excluded_urls)
+            app.wsgi_app = _rewrapped_app(
+                app.wsgi_app,
+                active_request_counter,
+                duration_histogram_old=duration_histogram_old,
+                excluded_urls=excluded_urls,
+                sem_conv_opt_in_mode=sem_conv_opt_in_mode,
+                duration_histogram_new=duration_histogram_new
+            )
 
             tracer = trace.get_tracer(
                 __name__,
                 __version__,
                 tracer_provider,
-                schema_url="https://opentelemetry.io/schemas/1.11.0"
+                schema_url=_get_schema_url(sem_conv_opt_in_mode)
             )
 
             _post_response = _wrapped_post_response(excluded_urls=excluded_urls)
-            _pre_response = _wrapped_pre_response(tracer=tracer, excluded_urls=excluded_urls)
+            _pre_response = _wrapped_pre_response(
+                tracer=tracer,
+                excluded_urls=excluded_urls,
+                enable_commenter=enable_commenter,
+                commenter_options=(
+                    commenter_options if commenter_options else {}
+                ),
+                sem_conv_opt_in_mode=sem_conv_opt_in_mode
+            )
 
             app._post_response = _post_response
             app._pre_response = _pre_response
@@ -268,6 +369,9 @@ class SimplerrInstrumentor(BaseInstrumentor):
 def _wrapped_pre_response(
         tracer=None,
         excluded_urls=None,
+        enable_commenter=True,
+        commenter_options=None,
+        sem_conv_opt_in_mode=_StabilityMode.DEFAULT,
 ):
     def _pre_response(request):
         if excluded_urls and excluded_urls.url_disabled(request.url):
@@ -276,7 +380,10 @@ def _wrapped_pre_response(
         simplerr_request_environ = request.environ
         span_name = get_default_span_name(request)
 
-        attributes = otel_wsgi.collect_request_attributes(simplerr_request_environ)
+        attributes = otel_wsgi.collect_request_attributes(
+            simplerr_request_environ,
+            sem_conv_opt_in_mode
+        )
 
         if request.url_rule:
             # For 404 that result from no route found, etc, we
@@ -308,6 +415,30 @@ def _wrapped_pre_response(
         simplerr_request_environ[_ENVIRON_ACTIVATION_KEY] = activation
         simplerr_request_environ[_ENVIRON_SPAN_KEY] = span
         simplerr_request_environ[_ENVIRON_TOKEN] = token
+
+        if enable_commenter:
+            current_context = context.get_current()
+            simplerr_info = {}
+
+            if commenter_options.get("framework", True):
+                simplerr_info["framework"] = f"simplerr:{simplerr_version}"
+            if (
+                    commenter_options.get('controller', True)
+                    and request.url_rule
+                    and request.url_rule.endpoint
+            ):
+                simplerr_info["controller"] = request.url_rule.endpoint
+            if (
+                    commenter_options.get('route', True)
+                    and request.url_rule
+                    and request.url_rule.rule
+            ):
+                simplerr_info["route"] = request.url_rule.rule
+
+            sqlcommenter_context = context.set_value(
+                "SQLCOMMENTER_ORM_TAGS_AND_VALUES", simplerr_info, current_context
+            )
+            context.attach(sqlcommenter_context)
 
     return _pre_response
 
