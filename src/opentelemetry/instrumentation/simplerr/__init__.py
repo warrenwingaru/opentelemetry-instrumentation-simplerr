@@ -3,6 +3,7 @@ This library builds on the OpenTelemetry WSGI middleware to track web requests
 in Simplerr applications.
 """
 from logging import getLogger
+from time import time_ns
 from timeit import default_timer
 from typing import Collection
 
@@ -13,8 +14,8 @@ from opentelemetry.instrumentation.propagators import (
 )
 from opentelemetry.instrumentation.utils import _start_internal_or_server_span
 from opentelemetry.metrics import get_meter
+from opentelemetry.semconv.metrics import MetricInstruments
 from opentelemetry.semconv.trace import SpanAttributes
-from opentelemetry.util._time import _time_ns
 from opentelemetry.util.http import parse_excluded_urls, get_excluded_urls
 
 import simplerr
@@ -51,7 +52,7 @@ def _rewrapped_app(
         excluded_urls=None,
 ):
     def _wrapped_app(wrapped_app_environ, start_response):
-        wrapped_app_environ[_ENVIRON_STARTTIME_KEY] = _time_ns()
+        wrapped_app_environ[_ENVIRON_STARTTIME_KEY] = time_ns()
 
         start = default_timer()
         attributes = otel_wsgi.collect_request_attributes(wrapped_app_environ)
@@ -129,25 +130,27 @@ class _InstrumentedWsgi(dispatcher.wsgi):
     _enable_commenter = True
     _commenter_options = None
     _meter_provider = None
-    _trace_provider = None
+    _tracer_provider = None
 
     def __init__(self, *args, **kwargs):
         super(_InstrumentedWsgi, self).__init__(*args, **kwargs)
 
+        self._original_wsgi_app = self.wsgi_app
         self._is_instrumented_by_opentelemetry = True
 
         meter = get_meter(
             __name__,
             __version__,
             _InstrumentedWsgi._meter_provider,
+            schema_url="https://opentelemetry.io/schemas/1.11.0",
         )
         duration_histogram = meter.create_histogram(
-            name="http.server.duration",
+            name=MetricInstruments.HTTP_SERVER_DURATION,
             unit="ms",
             description="measures the duration of the inbound HTTP request",
         )
         active_request_counter = meter.create_up_down_counter(
-            name="http.server.active_requests",
+            name=MetricInstruments.HTTP_SERVER_ACTIVE_REQUESTS,
             unit="requests",
             description="measures the number of concurrent HTTP requests that are currently in-flight"
         )
@@ -158,7 +161,8 @@ class _InstrumentedWsgi(dispatcher.wsgi):
         tracer = trace.get_tracer(
             __name__,
             __version__,
-            _InstrumentedWsgi._trace_provider,
+            _InstrumentedWsgi._tracer_provider,
+            schema_url="https://opentelemetry.io/schemas/1.11.0"
         )
 
         self._post_response = _wrapped_post_response(excluded_urls=_InstrumentedWsgi._excluded_urls)
@@ -211,6 +215,7 @@ class SimplerrInstrumentor(BaseInstrumentor):
                 __name__,
                 __version__,
                 meter_provider,
+                schema_url="https://opentelemetry.io/schemas/1.11.0",
             )
             duration_histogram = meter.create_histogram(
                 name="http.server.duration",
@@ -222,7 +227,7 @@ class SimplerrInstrumentor(BaseInstrumentor):
                 unit="requests",
                 description="measures the number of concurrent HTTP requests that are currently in-flight"
             )
-            app._original_app = app.wsgi_app
+            app._original_wsgi_app = app.wsgi_app
 
             app.wsgi_app = _rewrapped_app(app.wsgi_app, active_request_counter, duration_histogram=duration_histogram,
                                           excluded_urls=excluded_urls)
@@ -231,6 +236,7 @@ class SimplerrInstrumentor(BaseInstrumentor):
                 __name__,
                 __version__,
                 tracer_provider,
+                schema_url="https://opentelemetry.io/schemas/1.11.0"
             )
 
             _post_response = _wrapped_post_response(excluded_urls=excluded_urls)
@@ -247,12 +253,12 @@ class SimplerrInstrumentor(BaseInstrumentor):
 
     @staticmethod
     def uninstrument_app(wsgi):
-        if hasattr(wsgi, '_original_app'):
-            wsgi.wsgi_app = wsgi._original_app
+        if hasattr(wsgi, '_original_wsgi_app'):
+            wsgi.wsgi_app = wsgi._original_wsgi_app
 
             wsgi.global_events.off_pre_response(wsgi._pre_response)
             wsgi.global_events.off_teardown_request(wsgi._post_response)
-            del wsgi._original_app
+            del wsgi._original_wsgi_app
             wsgi._is_instrumented_by_opentelemetry = False
         else:
             _logger.warning("Attempting to uninstrument Simplerr "
@@ -270,19 +276,23 @@ def _wrapped_pre_response(
         simplerr_request_environ = request.environ
         span_name = get_default_span_name(request)
 
+        attributes = otel_wsgi.collect_request_attributes(simplerr_request_environ)
+
+        if request.url_rule:
+            # For 404 that result from no route found, etc, we
+            # don't have a url_rule
+            attributes[SpanAttributes.HTTP_ROUTE] = str(request.url_rule.rule)
+
         span, token = _start_internal_or_server_span(
             tracer=tracer,
             span_name=span_name,
             start_time=simplerr_request_environ.get(_ENVIRON_STARTTIME_KEY),
             context_carrier=simplerr_request_environ,
             context_getter=otel_wsgi.wsgi_getter,
+            attributes=attributes,
         )
 
         if span.is_recording():
-            attributes = otel_wsgi.collect_request_attributes(simplerr_request_environ)
-            print('has url rule {}'.format(request.url_rule) )
-            if request.url_rule:
-                attributes[SpanAttributes.HTTP_ROUTE] = str(request.url_rule.rule)
             for key, value in attributes.items():
                 span.set_attribute(key, value)
             if span.is_recording() and span.kind == trace.SpanKind.SERVER:

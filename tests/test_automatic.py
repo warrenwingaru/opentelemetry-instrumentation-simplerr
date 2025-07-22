@@ -1,9 +1,10 @@
 import os
 
 from werkzeug.test import Client
-from werkzeug.wrappers import Response
+from simplerr import Response
 
 import simplerr.dispatcher
+from opentelemetry import trace as trace_api
 from opentelemetry.instrumentation.simplerr import SimplerrInstrumentor
 from opentelemetry.test.wsgitestutil import WsgiTestBase
 from .base_test import InstrumentationTest
@@ -59,5 +60,20 @@ class TestAutomatic(InstrumentationTest, WsgiTestBase):
         self.assertEqual([b"Hello: 456"], list(resp.response))
         span_list = self.memory_exporter.get_finished_spans()
         self.assertEqual(len(span_list), 1)
+
+    def test_no_op_tracer_provider(self):
+        SimplerrInstrumentor().uninstrument()
+
+        SimplerrInstrumentor().instrument(tracer_provider=trace_api.NoOpTracerProvider())
+
+        self._create_app()
+        self.client = Client(self.app, Response)
+
+        self.client.get("/hello/123")
+
+        span_list = self.memory_exporter.get_finished_spans()
+        self.assertEqual(len(span_list), 0)
+
+
 
 

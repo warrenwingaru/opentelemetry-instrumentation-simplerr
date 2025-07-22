@@ -1,4 +1,5 @@
 import simplerr
+from simplerr import GET
 
 
 def hello_endpoint(request, helloid):
@@ -7,7 +8,7 @@ def hello_endpoint(request, helloid):
     return f"Hello: {helloid}"
 
 
-@simplerr.web("/hello/<int:helloid>")
+@simplerr.web("/hello/<int:helloid>", GET)
 def hello_id(request, helloid):
     return hello_endpoint(request, helloid)
 
