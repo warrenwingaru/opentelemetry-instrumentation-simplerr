@@ -7,7 +7,7 @@ from opentelemetry.instrumentation.propagators import get_global_response_propag
     TraceResponsePropagator
 from opentelemetry.sdk.metrics._internal.point import HistogramDataPoint, NumberDataPoint
 from opentelemetry.semconv.trace import SpanAttributes
-from opentelemetry.util.http import get_excluded_urls
+from opentelemetry.util.http import get_excluded_urls, OTEL_PYTHON_INSTRUMENTATION_HTTP_CAPTURE_ALL_METHODS
 from werkzeug import Response
 
 from opentelemetry import trace
@@ -65,7 +65,7 @@ class TestProgrammatic(InstrumentationTest, WsgiTestBase):
         )
         self.exclude_patch.start()
 
-        self.app = simplerr.dispatcher.wsgi('tests/website')
+        self._create_app()
         SimplerrInstrumentor().instrument_app(self.app)
 
         self._common_initialization()
@@ -122,8 +122,6 @@ class TestProgrammatic(InstrumentationTest, WsgiTestBase):
         span_list = self.memory_exporter.get_finished_spans()
         self.assertEqual(len(span_list), 1)
         span = span_list[0]
-        print(span.attributes)
-        print(expected_attrs)
         self.assertEqual(span.name, "GET /hello/<int:helloid>")
         self.assertEqual(span.kind, trace.SpanKind.SERVER)
         self.assertEqual(span.attributes, expected_attrs)
@@ -169,7 +167,7 @@ class TestProgrammatic(InstrumentationTest, WsgiTestBase):
         span_list = self.memory_exporter.get_finished_spans()
         self.assertEqual(len(span_list), 1)
         span = span_list[0]
-        self.assertEqual(span.name, "HTTP POST")
+        self.assertEqual(span.name, "POST /bye")
         self.assertEqual(span.kind, trace.SpanKind.SERVER)
         self.assertEqual(span.attributes, expected_attrs)
 
@@ -259,6 +257,24 @@ class TestProgrammatic(InstrumentationTest, WsgiTestBase):
                         if isinstance(point, NumberDataPoint):
                             self.assertEqual(point.value, 0)
 
+    def _assert_basic_metric(self, expected_duration_attr, expected_requests_count_attr):
+        metrics_list = self.memory_metrics_reader.get_metrics_data()
+        for resource_metric in metrics_list.resource_metrics:
+            for scope_metric in resource_metric.scope_metrics:
+                for metric in scope_metric.metrics:
+                    for point in list(metric.data.data_points):
+                        if isinstance(point, HistogramDataPoint):
+                            self.assertDictEqual(
+                                expected_duration_attr,
+                                dict(point.attributes)
+                            )
+                        elif isinstance(point, NumberDataPoint):
+                            self.assertDictEqual(
+                                expected_requests_count_attr,
+                                dict(point.attributes)
+                            )
+                            self.assertEqual(point.value, 0)
+
     def test_basic_metric_success(self):
         self.client.get("/hello/756")
         expected_duration_attr = {
@@ -279,25 +295,53 @@ class TestProgrammatic(InstrumentationTest, WsgiTestBase):
             "http.server_name": "localhost",
         }
 
-        metrics_list = self.memory_metrics_reader.get_metrics_data()
-        for resource_metric in metrics_list.resource_metrics:
-            for scope_metric in resource_metric.scope_metrics:
-                for metric in scope_metric.metrics:
-                    for point in list(metric.data.data_points):
-                        if isinstance(point, HistogramDataPoint):
-                            print(expected_duration_attr)
-                            print(dict(point.attributes))
-                            self.assertDictEqual(
-                                expected_duration_attr,
-                                dict(point.attributes)
-                            )
-                            self.assertEqual(point.count, 1)
-                        if isinstance(point, NumberDataPoint):
-                            self.assertDictEqual(
-                                expected_requests_count_attr,
-                                dict(point.attributes)
-                            )
-                            self.assertEqual(point.value, 0)
+        self._assert_basic_metric(expected_duration_attr, expected_requests_count_attr)
+
+    def test_basic_metric_nonstandard_http_method_success(self):
+        self.client.open("/hello/756", method="NONSTANDARD")
+        expected_duration_attr = {
+            "http.method": "UNKNOWN",
+            "http.host": "localhost",
+            "http.scheme": "http",
+            "http.flavor": "1.1",
+            "http.server_name": "localhost",
+            "net.host.port": 80,
+            "http.status_code": 405,
+        }
+        expected_requests_count_attr = {
+            "http.method": "UNKNOWN",
+            "http.host": "localhost",
+            "http.scheme": "http",
+            "http.flavor": "1.1",
+            "http.server_name": "localhost",
+        }
+        self._assert_basic_metric(expected_duration_attr, expected_requests_count_attr)
+
+    @patch.dict(
+        "os.environ",
+        {
+            OTEL_PYTHON_INSTRUMENTATION_HTTP_CAPTURE_ALL_METHODS: "1"
+        }
+    )
+    def test_basic_metric_nonstandard_http_method_allowed_success(self):
+        self.client.open("/hello/756", method="NONSTANDARD")
+        expected_duration_attr = {
+            "http.method": "NONSTANDARD",
+            "http.host": "localhost",
+            "http.scheme": "http",
+            "http.flavor": "1.1",
+            "http.server_name": "localhost",
+            "net.host.port": 80,
+            "http.status_code": 405,
+        }
+        expected_requests_count_attr = {
+            "http.method": "NONSTANDARD",
+            "http.host": "localhost",
+            "http.scheme": "http",
+            "http.flavor": "1.1",
+            "http.server_name": "localhost",
+        }
+        self._assert_basic_metric(expected_duration_attr, expected_requests_count_attr)
 
     def test_metric_uninstrument(self):
         self.client.delete("/hello/756")
