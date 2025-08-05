@@ -1,3 +1,5 @@
+from opentelemetry import context
+
 import simplerr
 from simplerr import GET
 
@@ -31,3 +33,11 @@ def excluded2_endpoint():
 # def assert_environ(request):
 #
 #
+
+@simplerr.web('/sqlcommenter')
+def sqlcommenter(request):
+    current_context = context.get_current()
+    sqlcommenter_simplerr_values = current_context.get(
+        "SQLCOMMENTER_ORM_TAGS_AND_VALUES", {}
+    )
+    return sqlcommenter_simplerr_values
