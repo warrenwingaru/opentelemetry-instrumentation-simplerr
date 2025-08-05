@@ -17,7 +17,7 @@ from opentelemetry.instrumentation._semconv import (
     _get_schema_url,
     _report_old,
     _report_new,
-    _StabilityMode
+    _StabilityMode, HTTP_DURATION_HISTOGRAM_BUCKETS_NEW
 )
 from opentelemetry import context, trace
 from opentelemetry.instrumentation.simplerr.package import _instruments
@@ -203,6 +203,7 @@ class _InstrumentedWsgi(simplerr.dispatcher.wsgi):
                 name=HTTP_SERVER_REQUEST_DURATION,
                 unit="s",
                 description="Duration of HTTP server requests.",
+                explicit_bucket_boundaries_advisory=HTTP_DURATION_HISTOGRAM_BUCKETS_NEW
             )
 
         active_request_counter = meter.create_up_down_counter(
@@ -304,6 +305,7 @@ class SimplerrInstrumentor(BaseInstrumentor):
                     name=HTTP_SERVER_REQUEST_DURATION,
                     unit="s",
                     description="Duration of HTTP server requests.",
+                    explicit_bucket_boundaries_advisory=HTTP_DURATION_HISTOGRAM_BUCKETS_NEW
                 )
 
             active_request_counter = meter.create_up_down_counter(
