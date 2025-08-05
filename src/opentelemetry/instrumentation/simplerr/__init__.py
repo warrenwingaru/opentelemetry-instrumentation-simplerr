@@ -52,8 +52,6 @@ _excluded_urls_from_env = get_excluded_urls("SIMPLERR")
 
 simplerr_version = version("simplerr")
 
-print(f'simplerr version: {simplerr_version}')
-
 
 def get_default_span_name(request):
     method = sanitize_method(
@@ -252,7 +250,6 @@ class SimplerrInstrumentor(BaseInstrumentor):
         )
 
         enable_commenter = kwargs.get('enable_commenter', True)
-        print(f'enable_commenter: {enable_commenter}')
         _InstrumentedWsgi._enable_commenter = enable_commenter
         commenter_options = kwargs.get('commenter_options', {})
         _InstrumentedWsgi._commenter_options = commenter_options
