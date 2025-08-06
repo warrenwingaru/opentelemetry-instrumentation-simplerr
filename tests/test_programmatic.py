@@ -12,12 +12,12 @@ from werkzeug import Response
 
 from opentelemetry import trace
 from opentelemetry.instrumentation._semconv import (
-OTEL_SEMCONV_STABILITY_OPT_IN,
-_OpenTelemetrySemanticConventionStability,
-_server_active_requests_count_attrs_new,
-_server_active_requests_count_attrs_old,
-_server_duration_attrs_new,
-_server_duration_attrs_old,
+    OTEL_SEMCONV_STABILITY_OPT_IN,
+    _OpenTelemetrySemanticConventionStability,
+    _server_active_requests_count_attrs_new,
+    _server_active_requests_count_attrs_old,
+    _server_duration_attrs_new,
+    _server_duration_attrs_old, HTTP_DURATION_HISTOGRAM_BUCKETS_NEW,
 )
 from opentelemetry.instrumentation.simplerr import SimplerrInstrumentor
 from opentelemetry.instrumentation.propagators import (
@@ -455,7 +455,12 @@ class TestProgrammatic(InstrumentationTest, WsgiTestBase):
                         if isinstance(point, NumberDataPoint):
                             self.assertEqual(point.value, 0)
 
-    def _assert_basic_metric(self, expected_duration_attr, expected_requests_count_attr):
+    def _assert_basic_metric(
+            self,
+            expected_duration_attr,
+            expected_requests_count_attr,
+            expected_histogram_explicit_bounds=None,
+    ):
         metrics_list = self.memory_metrics_reader.get_metrics_data()
         for resource_metric in metrics_list.resource_metrics:
             for scope_metric in resource_metric.scope_metrics:
@@ -466,6 +471,11 @@ class TestProgrammatic(InstrumentationTest, WsgiTestBase):
                                 expected_duration_attr,
                                 dict(point.attributes)
                             )
+                            if expected_histogram_explicit_bounds is not None:
+                                self.assertEqual(
+                                    expected_histogram_explicit_bounds,
+                                    point.explicit_bounds
+                                )
                         elif isinstance(point, NumberDataPoint):
                             self.assertDictEqual(
                                 expected_requests_count_attr,
@@ -510,7 +520,12 @@ class TestProgrammatic(InstrumentationTest, WsgiTestBase):
             "url.scheme": "http",
         }
 
-        self._assert_basic_metric(expected_duration_attr, expected_requests_count_attr)
+        self._assert_basic_metric(
+            expected_duration_attr,
+            expected_requests_count_attr,
+            expected_histogram_explicit_bounds=HTTP_DURATION_HISTOGRAM_BUCKETS_NEW
+
+        )
 
     def test_basic_metric_nonstandard_http_method_success(self):
         self.client.open("/hello/756", method="NONSTANDARD")
@@ -565,7 +580,11 @@ class TestProgrammatic(InstrumentationTest, WsgiTestBase):
             "http.request.method": "NONSTANDARD",
             "url.scheme": "http",
         }
-        self._assert_basic_metric(expected_duration_attr, expected_requests_count_attr)
+        self._assert_basic_metric(
+            expected_duration_attr,
+            expected_requests_count_attr,
+            expected_histogram_explicit_bounds=HTTP_DURATION_HISTOGRAM_BUCKETS_NEW
+        )
 
     def test_metric_uninstrument(self):
         self.client.delete("/hello/756")
